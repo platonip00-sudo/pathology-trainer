@@ -74,6 +74,48 @@
     return aa.every((v, i) => v === bb[i]);
   }
 
+  function questionKind(q) {
+    return q.type || "choice";
+  }
+
+  function hasAnswer(q, a) {
+    if (!a || !Array.isArray(a.selected)) return false;
+    if (questionKind(q) === "matching") return a.selected.some(row => Array.isArray(row) && row.length);
+    return a.selected.length > 0;
+  }
+
+  function isAnswerCorrect(q, a) {
+    if (!hasAnswer(q, a)) return false;
+    if (questionKind(q) === "matching") {
+      return q.correct.every((expected, row) => sameSet(a.selected[row] || [], expected));
+    }
+    if (questionKind(q) === "sequence") {
+      return q.correct.length === a.selected.length && q.correct.every((index, position) => index === a.selected[position]);
+    }
+    return sameSet(a.selected, q.correct);
+  }
+
+  function answerText(q, selected, empty = "Ответ не выбран") {
+    if (!selected?.length) return empty;
+    if (questionKind(q) === "sequence") return selected.map(index => q.labels[index]).join(" → ");
+    if (questionKind(q) === "matching") {
+      if (!selected.some(row => Array.isArray(row) && row.length)) return empty;
+      return q.labels.map((label, row) => `${label}–${(selected[row] || []).map(index => index + 1).join(", ") || "—"}`).join("; ");
+    }
+    return selected.map(index => q.options[index]).join("; ");
+  }
+
+  function bankAnswerHtml(q) {
+    if (questionKind(q) === "sequence") {
+      return q.correct.map((index, position) => `<div class="bank-answer-item">${position + 1}. ${escapeHtml(q.labels[index])} — ${escapeHtml(q.options[index])}</div>`).join("");
+    }
+    if (questionKind(q) === "matching") {
+      return q.correct.map((indexes, row) => `<div class="bank-answer-item">${escapeHtml(q.labels[row])} — ${indexes.map(index => `${index + 1}. ${escapeHtml(q.options[index])}`).join("; ")}</div>`).join("");
+    }
+    return q.correct.map(index => q.options[index]).filter(Boolean)
+      .map(answer => `<div class="bank-answer-item">${escapeHtml(answer)}</div>`).join("");
+  }
+
   function getStats() {
     const attemptedUnique = Object.keys(progress.perQuestion || {}).length;
     const pct = progress.totalAttempts ? Math.round((progress.correctAttempts / progress.totalAttempts) * 100) : 0;
@@ -147,20 +189,17 @@
   function renderQuestionBank() {
     clearTimer();
     const cards = QUESTIONS.map(q => {
-      const answers = q.correct
-        .map(idx => q.options[idx])
-        .filter(Boolean)
-        .map(answer => `<div class="bank-answer-item">${escapeHtml(answer)}</div>`)
-        .join("");
+      const answers = bankAnswerHtml(q);
       return `
         <details class="bank-card" data-bank-id="${q.id}">
           <summary>
-            <span class="bank-id">ID ${q.id}</span>
+            <span class="bank-id">ID ${q.id}${q.sourceNumber ? ` · доп. №${q.sourceNumber}` : ""}</span>
             <span class="bank-question">${escapeHtml(q.question)}</span>
             <span class="bank-chevron" aria-hidden="true">▾</span>
           </summary>
           <div class="bank-answer">
-            <strong>${q.multiple ? "Правильные ответы" : "Правильный ответ"}</strong>
+            <strong>${questionKind(q) === "sequence" ? "Правильная последовательность" : questionKind(q) === "matching" ? "Правильные соответствия" : q.multiple ? "Правильные ответы" : "Правильный ответ"}</strong>
+            ${questionKind(q) === "matching" ? `<p>Варианты: ${q.options.map((option, index) => `${index + 1}. ${escapeHtml(option)}`).join("; ")}</p>` : ""}
             ${answers}
             ${q.sourceNote ? `<p class="source-note">${escapeHtml(q.sourceNote)}</p>` : ""}
           </div>
@@ -204,7 +243,7 @@
       const id = Number(card.dataset.bankId);
       const q = qById.get(id);
       const haystack = q
-        ? `${q.id} ${q.question} ${q.options.join(" ")}`.toLocaleLowerCase("ru-RU")
+        ? `${q.id} ${q.sourceNumber || ""} ${q.question} ${(q.left || []).join(" ")} ${q.options.join(" ")}`.toLocaleLowerCase("ru-RU")
         : "";
       const show = !normalized || haystack.includes(normalized);
       card.hidden = !show;
@@ -273,7 +312,7 @@
     ids.forEach(id => {
       const q = qById.get(id);
       const base = q.options.map((_, i) => i);
-      optionOrder[id] = shuffleOptions ? shuffle(base) : base;
+      optionOrder[id] = shuffleOptions && questionKind(q) === "choice" ? shuffle(base) : base;
     });
     return {
       mode,
@@ -330,6 +369,37 @@
     return session.answers[id];
   }
 
+  function renderSequenceInput(q, a, locked) {
+    const selected = Array.isArray(a.selected) ? a.selected : [];
+    const selectedHtml = selected.length
+      ? selected.map((index, position) => `<span class="sequence-step">${position + 1}. ${escapeHtml(q.labels[index])}</span>`).join("")
+      : `<span class="structured-hint">Нажимай на этапы в нужном порядке. Повторное нажатие убирает этап.</span>`;
+    const choices = q.options.map((option, index) => {
+      const position = selected.indexOf(index);
+      return `<button class="sequence-option ${position >= 0 ? "selected" : ""}" data-sequence-index="${index}" ${locked ? "disabled" : ""}>
+        <span class="sequence-letter">${escapeHtml(q.labels[index])}</span>
+        <span>${escapeHtml(option)}</span>
+        ${position >= 0 ? `<span class="sequence-position">${position + 1}</span>` : ""}
+      </button>`;
+    }).join("");
+    return `<div class="structured-task"><strong>Твой порядок</strong><div class="sequence-selected">${selectedHtml}</div><strong>Этапы</strong><div class="sequence-options">${choices}</div></div>`;
+  }
+
+  function renderMatchingInput(q, a, locked) {
+    const choices = `<ol class="matching-choices">${q.options.map(option => `<li>${escapeHtml(option)}</li>`).join("")}</ol>`;
+    const rows = q.left.map((left, row) => {
+      const selected = Array.isArray(a.selected[row]) ? a.selected[row] : [];
+      const control = q.multiple
+        ? `<div class="matching-checks">${q.options.map((_, index) => `<label><input type="checkbox" data-match-row="${row}" data-match-choice="${index}" ${selected.includes(index) ? "checked" : ""} ${locked ? "disabled" : ""} /><span>${index + 1}</span></label>`).join("")}</div>`
+        : `<select class="matching-select" data-match-row="${row}" aria-label="Соответствие для ${escapeHtml(q.labels[row])}" ${locked ? "disabled" : ""}>
+            <option value="">Выбрать номер</option>
+            ${q.options.map((_, index) => `<option value="${index}" ${selected.includes(index) ? "selected" : ""}>${index + 1}</option>`).join("")}
+          </select>`;
+      return `<div class="matching-row"><div><strong>${escapeHtml(q.labels[row])}</strong> ${escapeHtml(left)}</div>${control}</div>`;
+    }).join("");
+    return `<div class="structured-task"><strong>Варианты для соответствия</strong>${choices}<div class="matching-rows">${rows}</div></div>`;
+  }
+
   function renderQuestion() {
     if (!session || !session.ids.length) return renderHome();
     const id = session.ids[session.index];
@@ -338,9 +408,9 @@
     const isPractice = session.mode !== "exam";
     const locked = isPractice && a.checked;
     const order = session.optionOrder[id];
-    const answeredCount = session.ids.filter(qid => (session.answers[qid]?.selected?.length || 0) > 0).length;
+    const answeredCount = session.ids.filter(qid => hasAnswer(qById.get(qid), session.answers[qid])).length;
 
-    const optionHtml = order.map((origIdx, displayIdx) => {
+    const choiceHtml = order.map((origIdx, displayIdx) => {
       const selected = a.selected.includes(origIdx);
       const correct = q.correct.includes(origIdx);
       let cls = selected ? "selected" : "";
@@ -354,6 +424,9 @@
           <span class="option-mark">${mark}</span>
         </button>`;
     }).join("");
+    const inputHtml = questionKind(q) === "sequence" ? renderSequenceInput(q, a, locked)
+      : questionKind(q) === "matching" ? renderMatchingInput(q, a, locked)
+      : `<div class="options">${choiceHtml}</div>`;
 
     let feedback = "";
     if (locked) {
@@ -366,15 +439,16 @@
       <section class="exam-layout">
         <div class="question-panel">
           <div class="question-top">
-            <div><span class="question-counter">Вопрос ${session.index + 1} из ${session.ids.length}</span><div class="question-status">ID ${q.id} · ${session.mode === "exam" ? "Экзамен" : session.mode === "mistakes" ? "Ошибки" : "Тренировка"}</div></div>
+            <div><span class="question-counter">Вопрос ${session.index + 1} из ${session.ids.length}</span><div class="question-status">ID ${q.id}${q.sourceNumber ? ` · доп. №${q.sourceNumber}` : ""} · ${session.mode === "exam" ? "Экзамен" : session.mode === "mistakes" ? "Ошибки" : "Тренировка"}</div></div>
             ${session.endsAt ? `<div class="timer" id="timer">--:--</div>` : ""}
           </div>
           <div class="question-body">
             <h2>${escapeHtml(q.question)}</h2>
             ${q.sourceNote ? `<p class="source-note">${escapeHtml(q.sourceNote)}</p>` : ""}
-            ${q.multiple ? `<div class="multi-note">Можно выбрать несколько вариантов</div>` : ""}
-            <div class="options">${optionHtml}</div>
+            ${questionKind(q) === "matching" && q.multiple ? `<div class="multi-note">К каждому пункту можно выбрать несколько номеров</div>` : questionKind(q) === "choice" && q.multiple ? `<div class="multi-note">Можно выбрать несколько вариантов</div>` : ""}
+            ${inputHtml}
             ${feedback}
+            ${locked && questionKind(q) !== "choice" ? `<div class="structured-correct"><strong>Правильный ответ:</strong> ${escapeHtml(answerText(q, q.correct))}</div>` : ""}
           </div>
           <div class="question-actions">
             <button class="btn btn-secondary" data-action="prev" ${session.index === 0 ? "disabled" : ""}>← Назад</button>
@@ -383,7 +457,7 @@
                 ? `<button class="btn btn-secondary" data-action="finish">Завершить</button><button class="btn btn-accent" data-action="save-next">${session.index === session.ids.length - 1 ? "Сохранить" : "Ответить и далее"}</button>`
                 : a.checked
                   ? `<button class="btn btn-accent" data-action="next">${session.index === session.ids.length - 1 ? "К результату" : "Далее →"}</button>`
-                  : `<button class="btn btn-accent" data-action="check" ${a.selected.length ? "" : "disabled"}>Проверить ответ</button>`
+                  : `<button class="btn btn-accent" data-action="check" ${hasAnswer(q, a) ? "" : "disabled"}>Проверить ответ</button>`
               }
             </div>
           </div>
@@ -395,7 +469,7 @@
             ${session.ids.map((qid, i) => {
               const ans = session.answers[qid];
               let cls = i === session.index ? "current" : "";
-              if (session.mode === "exam" && ans?.selected?.length) cls += " answered";
+              if (session.mode === "exam" && hasAnswer(qById.get(qid), ans)) cls += " answered";
               if (session.mode !== "exam" && ans?.checked) cls += ans.isCorrect ? " good" : " bad";
               return `<button class="qnav ${cls}" data-jump="${i}">${i + 1}</button>`;
             }).join("")}
@@ -424,6 +498,36 @@
     renderQuestion();
   }
 
+  function selectSequenceItem(index) {
+    if (!session) return;
+    const q = qById.get(session.ids[session.index]);
+    if (questionKind(q) !== "sequence" || index < 0 || index >= q.options.length) return;
+    const a = answerState(q.id);
+    if (session.mode !== "exam" && a.checked) return;
+    a.selected = a.selected.includes(index) ? a.selected.filter(item => item !== index) : [...a.selected, index];
+    persistSession();
+    renderQuestion();
+  }
+
+  function setMatchingSelection(row, choice, checked) {
+    if (!session) return;
+    const q = qById.get(session.ids[session.index]);
+    if (questionKind(q) !== "matching" || row < 0 || row >= q.left.length) return;
+    const a = answerState(q.id);
+    if (session.mode !== "exam" && a.checked) return;
+    if (!Array.isArray(a.selected[row])) a.selected[row] = [];
+    if (q.multiple) {
+      if (choice < 0 || choice >= q.options.length) return;
+      a.selected[row] = checked
+        ? [...new Set([...a.selected[row], choice])]
+        : a.selected[row].filter(index => index !== choice);
+    } else {
+      a.selected[row] = choice >= 0 && choice < q.options.length ? [choice] : [];
+    }
+    persistSession();
+    renderQuestion();
+  }
+
   function recordAnswer(q, a) {
     if (a.recorded) return;
     a.recorded = true;
@@ -443,8 +547,8 @@
   function checkCurrent() {
     const q = qById.get(session.ids[session.index]);
     const a = answerState(q.id);
-    if (!a.selected.length) return;
-    a.isCorrect = sameSet(a.selected, q.correct);
+    if (!hasAnswer(q, a)) return;
+    a.isCorrect = isAnswerCorrect(q, a);
     a.checked = true;
     recordAnswer(q, a);
     persistSession();
@@ -468,7 +572,7 @@
     session.ids.forEach(id => {
       const q = qById.get(id);
       const a = answerState(id);
-      a.isCorrect = a.selected.length > 0 && sameSet(a.selected, q.correct);
+      a.isCorrect = isAnswerCorrect(q, a);
       a.checked = true;
       recordAnswer(q, a);
     });
@@ -481,7 +585,7 @@
   function renderResults() {
     const entries = session.ids.map(id => ({ q: qById.get(id), a: answerState(id) }));
     const correct = entries.filter(x => x.a.isCorrect).length;
-    const unanswered = entries.filter(x => !x.a.selected.length).length;
+    const unanswered = entries.filter(x => !hasAnswer(x.q, x.a)).length;
     const wrong = entries.length - correct - unanswered;
     const pct = entries.length ? Math.round(correct / entries.length * 100) : 0;
     const problemIds = entries.filter(x => !x.a.isCorrect).map(x => x.q.id);
@@ -510,8 +614,8 @@
     const cards = reviewIds.map((id, i) => {
       const q = qById.get(id);
       const a = session?.answers?.[id] || { selected: [] };
-      const userText = a.selected.length ? a.selected.map(idx => q.options[idx]).join("; ") : "Ответ не выбран";
-      const correctText = q.correct.map(idx => q.options[idx]).join("; ");
+      const userText = answerText(q, a.selected);
+      const correctText = answerText(q, q.correct);
       return `
         <article class="review-card">
           <h3>${i + 1}. ${escapeHtml(q.question)}</h3>
@@ -570,6 +674,9 @@
     const option = event.target.closest("[data-option]");
     if (option) return selectOption(Number(option.dataset.option));
 
+    const sequenceOption = event.target.closest("[data-sequence-index]");
+    if (sequenceOption) return selectSequenceItem(Number(sequenceOption.dataset.sequenceIndex));
+
     const jump = event.target.closest("[data-jump]");
     if (jump && session) {
       session.index = Number(jump.dataset.jump);
@@ -614,6 +721,14 @@
 
   app.addEventListener("input", (event) => {
     if (event.target?.id === "bankSearch") filterQuestionBank(event.target.value);
+  });
+
+  app.addEventListener("change", (event) => {
+    const field = event.target.closest("[data-match-row]");
+    if (!field) return;
+    const row = Number(field.dataset.matchRow);
+    const choice = field.type === "checkbox" ? Number(field.dataset.matchChoice) : field.value === "" ? -1 : Number(field.value);
+    setMatchingSelection(row, choice, field.type === "checkbox" && field.checked);
   });
 
   document.getElementById("brandButton").addEventListener("click", renderHome);
